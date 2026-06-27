@@ -808,9 +808,10 @@ const fixCors = ({ headers, status, statusText }) => {
 const handleOPTIONS = async () => {
   return new Response(null, {
     headers: {
-      "Access-Control-Allow-Origin", "*",
-      "Access-Control-Allow-Methods", "*",
-      "Access-Control-Allow-Headers", "*",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Auth-Token, x-goog-api-key",
+      "Access-Control-Max-Age": "86400",
     }
   });
 };
