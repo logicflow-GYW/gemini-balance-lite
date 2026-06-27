@@ -1,0 +1,18 @@
+name = "gemini-balance-lite"
+main = "_worker.js"
+compatibility_date = "2026-06-28"
+
+# 环境变量配置
+[vars]
+AUTH_TOKEN = "your_secret_token"
+MAX_RETRIES = "2"
+THINKING_DISPLAY_MODE = "separate"
+
+# 如果需要启用持久化统计和缓存，请取消下面的注释并填写你的 KV ID
+# [[kv_namespaces]]
+# binding = "GEMINI_DATA"
+# id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# [[kv_namespaces]]
+# binding = "KV_STATS"
+# id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"

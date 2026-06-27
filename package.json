@@ -1,0 +1,12 @@
+{
+  "name": "gemini-balance-lite",
+  "version": "4.0.0",
+  "description": "High-availability Gemini API load balancer proxy for Cloudflare Workers",
+  "main": "_worker.js",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
