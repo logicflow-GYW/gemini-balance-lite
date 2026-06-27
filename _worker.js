@@ -142,10 +142,13 @@ function keyPrefix(key) {
 }
 
 function checkAuth(request, env) {
-  const AUTH_TOKEN = env.AUTH_TOKEN || "YOUR_SECRET_TOKEN";
+  const AUTH_TOKEN = env.AUTH_TOKEN;
   if (AUTH_TOKEN === "YOUR_SECRET_TOKEN") return true;
   const authHeader = request.headers.get("X-Auth-Token");
-  return authHeader === AUTH_TOKEN;
+  if (!AUTH_TOKEN || AUTH_TOKEN === "YOUR_SECRET_TOKEN") {
+    console.error("[Security] AUTH_TOKEN not configured! All requests will be rejected.");
+    return false;
+  }
 }
 
 function getNextMinuteReset() {
@@ -212,6 +215,10 @@ async function loadKeyStateFromKV(env, key) {
 
 async function saveKeyStateToKV(env, state) {
   if (!env || !env.KV_STATS) return;
+  const now = Date.now();
+  const lastWrite = state._lastKVWrite || 0;
+  if (now - lastWrite < 2000) return;
+  state._lastKVWrite = now;
   try {
     await env.KV_STATS.put(
       `key_state:${state.keyId}`,
@@ -219,8 +226,9 @@ async function saveKeyStateToKV(env, state) {
       { expirationTtl: 86400 * 7 }
     );
   } catch (e) {
-    console.error('[KV Save Error]', e);
+    console.error("[KV Save Error]", e);
   }
+}
 }
 
 async function initializeKeyStates(apiKeys, env) {
@@ -303,13 +311,13 @@ async function selectBestKey(apiKeys, env) {
 
 function calculateKeyScore(state, rpmRemaining, rpdRemaining) {
   let score = 100;
-  score += rpmRemaining * 3;
-  score += (rpdRemaining / 10);
+  score += Math.min(rpmRemaining * 2, 50);
+  score += Math.min(rpdRemaining / 10, 30);
   
   if (state.rpm.confidence === 'high') score += 20;
   if (state.totalRequests > 0) {
     const rate = state.totalSuccesses / state.totalRequests;
-    score += rate * 40;
+    score += rate * 60;
   }
   
   score += state.consecutiveSuccesses * 2;
@@ -1296,10 +1304,23 @@ const transformFnCalls = ({ tool_calls }) => {
       throw new HttpError(`Unsupported tool_call type: "${type}"`, 400);
     }
     let args;
-    try {
-      args = JSON.parse(argstr);
-    } catch (err) {
-      throw new HttpError("Invalid function arguments: " + argstr, 400);
+    // 类型安全的参数解析
+    if (argstr === null || argstr === undefined) {
+      args = {};
+    } else if (typeof argstr === 'object') {
+      args = argstr;
+    } else if (typeof argstr === 'string') {
+      if (argstr.trim() === "") {
+        args = {};
+      } else {
+        try {
+          args = JSON.parse(argstr);
+        } catch (err) {
+          throw new HttpError(`Invalid function arguments: unable to parse JSON. Original value: "${argstr.substring(0, 100)}...", Error: ${err.message}`, 400);
+        }
+      }
+    } else {
+      throw new HttpError(`Invalid function arguments: expected string or object, got ${typeof argstr}`, 400);
     }
     calls[id] = { i, name };
     const part = {
@@ -1441,6 +1462,15 @@ const reasonsMap = {
   "SAFETY": "content_filter",
   "RECITATION": "content_filter",
 };
+// 清洗 Gemini 返回的可能包含 Markdown 代码块的 JSON
+const cleanMarkdownJSON = (value) => {
+  if (typeof value === "string") {
+    // 移除 ```json ... ``` 或 ``` ... ``` 包裹
+    return value.replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "").trim();
+  }
+  return value;
+};
+
 const SEP = "\n\n|>";
 const transformCandidates = (key, cand, env) => {
   const message = { role: "assistant", content: [], reasoning_content: [] };
@@ -1453,7 +1483,7 @@ const transformCandidates = (key, cand, env) => {
       const toolCall = {
         id: fc.id ?? "call_" + generateId(),
         type: "function",
-        function: { name: fc.name, arguments: JSON.stringify(fc.args) },
+        function: { name: fc.name, arguments: typeof fc.args === "string" ? cleanMarkdownJSON(fc.args) : JSON.stringify(fc.args) },
       };
       if (part.thought_signature) {
         toolCall.thought_signature = part.thought_signature;
@@ -1555,8 +1585,13 @@ const processCompletionsResponse = (data, model, id, env) => {
 };
 
 const responseLineRE = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
+const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB 限制
 function parseStream(chunk, controller) {
   this.buffer += chunk;
+  if (this.buffer.length > MAX_BUFFER_SIZE) {
+    controller.error(new Error(`Stream buffer overflow: exceeded ${MAX_BUFFER_SIZE} bytes.`));
+    return;
+  }
   do {
     const match = this.buffer.match(responseLineRE);
     if (!match) break;
