@@ -534,15 +534,9 @@ async function detect429Type(response) {
 //  辅助函数：获取统计信息（增强版）
 // ============================================================
 async function handleStats(request, env) {
-  if (!checkAuth(request, env)) {
-    return new Response(JSON.stringify({ error: "Unauthorized" }), { 
-      status: 401,
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-
   const url = new URL(request.url);
   const action = url.searchParams.get("action") || "summary";
+  const corsHeaders = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
   
   if (action === "summary") {
     const summary = {
@@ -588,13 +582,13 @@ async function handleStats(request, env) {
       });
     }
     return new Response(JSON.stringify(keysDetails, null, 2), {
-      status: 200, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      status: 200, headers: corsHeaders
     });
   }
 
   if (!env.KV_STATS) {
     return new Response(JSON.stringify({ error: "KV_STATS not bound" }), { 
-      status: 500, headers: { 'Content-Type': 'application/json' }
+      status: 500, headers: corsHeaders
     });
   }
   
@@ -622,11 +616,11 @@ async function handleStats(request, env) {
       total_errors: stats.reduce((sum, s) => sum + (s.errors || 0), 0),
       keys: stats
     }, null, 2), {
-      status: 200, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      status: 200, headers: corsHeaders
     });
   } catch (error) {
     return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
+      status: 500, headers: corsHeaders
     });
   }
 }
@@ -833,17 +827,11 @@ async function verifyKey(key, controller) {
 }
 
 async function handleVerification(request, env) {
-  if (!checkAuth(request, env)) {
-    return new Response(JSON.stringify({ error: "Unauthorized" }), { 
-      status: 401, headers: { 'Content-Type': 'application/json' }
-    });
-  }
-
   try {
     const apiKeysHeader = request.headers.get('x-goog-api-key');
     if (!apiKeysHeader) {
       return new Response(JSON.stringify({ error: 'Missing x-goog-api-key header.' }), {
-        status: 400, headers: { 'Content-Type': 'application/json' }
+        status: 400, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
       });
     }
     const keys = apiKeysHeader.split(',').map(k => k.trim()).filter(Boolean);
@@ -862,11 +850,12 @@ async function handleVerification(request, env) {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
       }
     });
   } catch (e) {
     return new Response(JSON.stringify({ error: 'An unexpected error occurred: ' + e.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
+      status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     });
   }
 }
