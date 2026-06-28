@@ -143,12 +143,16 @@ function keyPrefix(key) {
 
 function checkAuth(request, env) {
   const AUTH_TOKEN = env.AUTH_TOKEN;
-  if (AUTH_TOKEN === "YOUR_SECRET_TOKEN") return true;
-  const authHeader = request.headers.get("X-Auth-Token");
-  if (!AUTH_TOKEN || AUTH_TOKEN === "YOUR_SECRET_TOKEN") {
-    console.error("[Security] AUTH_TOKEN not configured! All requests will be rejected.");
-    return false;
-  }
+  if (!AUTH_TOKEN || AUTH_TOKEN === "YOUR_SECRET_TOKEN") return false;
+  
+  // 方式1：原生 Header 验证
+  if (request.headers.get("X-Auth-Token") === AUTH_TOKEN) return true;
+  
+  // 方式2：网址 token 验证 (专门为你现在用的客户端加的)
+  const url = new URL(request.url);
+  if (url.searchParams.get("token") === AUTH_TOKEN) return true;
+  
+  return false;
 }
 
 function getNextMinuteReset() {
@@ -206,6 +210,10 @@ async function loadKeyStateFromKV(env, key) {
   if (!env || !env.KV_STATS) return null;
   try {
     const saved = await env.KV_STATS.get(`key_state:${keyPrefix(key)}`, { type: 'json' });
+    if (saved) {
+      // 去除运行时字段，避免跨实例恢复陈旧节流时间戳
+      delete saved._lastKVWrite;
+    }
     return saved;
   } catch (e) {
     console.error('[KV Load Error]', e);
@@ -229,10 +237,18 @@ async function saveKeyStateToKV(env, state) {
     console.error("[KV Save Error]", e);
   }
 }
-}
 
 async function initializeKeyStates(apiKeys, env) {
   if (!apiKeys || apiKeys.length === 0) return;
+  
+  // 清理本次请求未携带的旧 Key（防内存泄漏：长跑实例下 Map 会无限增长）
+  const currentSet = new Set(apiKeys);
+  for (const existingKey of Array.from(KEY_STATES.keys())) {
+    if (!currentSet.has(existingKey)) {
+      KEY_STATES.delete(existingKey);
+    }
+  }
+
   for (const key of apiKeys) {
     if (!KEY_STATES.has(key)) {
       const savedState = await loadKeyStateFromKV(env, key);
@@ -335,11 +351,15 @@ async function randomDelay() {
 }
 
 function getRandomUserAgent() {
+  // 仅使用 SDK 类 UA，避免混入浏览器指纹触发反爬
   const uas = [
     'genai-js/0.21.0',
     'genai-js/0.20.1',
+    'genai-js/0.19.0',
     'google-genai-python/1.0.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'google-genai-python/0.8.0',
+    'google-genai-node/0.4.0',
+    'GenAI-Go/0.5.0',
   ];
   return uas[Math.floor(Math.random() * uas.length)];
 }
@@ -630,7 +650,7 @@ async function handleRequest(request, env, context) {
   if (pathname === '/probe' && request.method === 'POST') {
     const results = await probeFailedKeys(env, context);
     return new Response(JSON.stringify({ results }), {
-      status: 200, headers: { 'Content-Type': 'application/json' }
+      status: 200, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     });
   }
 
@@ -828,8 +848,8 @@ const BASE_URL = "https://generativelanguage.googleapis.com";
 const API_VERSION = "v1beta";
 const API_CLIENT = "genai-js/0.21.0";
 
+// 注意：x-goog-api-client 由调用方注入随机 UA，此处不预设常量
 const makeHeaders = (apiKey, more) => ({
-  "x-goog-api-client": API_CLIENT,
   ...(apiKey && { "x-goog-api-key": apiKey }),
   ...more
 });
@@ -844,7 +864,7 @@ async function handleOpenAI(request, env, context) {
   };
   try {
     const auth = request.headers.get("Authorization");
-    let apiKey = auth?.split(" ")[1];
+    let apiKey = auth?.replace(/^Bearer\s+/i, '').trim();
     let apiKeys = [];
     if (apiKey) {
       apiKeys = apiKey.split(',').map(k => k.trim()).filter(k => k);
@@ -857,30 +877,87 @@ async function handleOpenAI(request, env, context) {
     await initializeKeyStates(apiKeys, env);
     await maintainKeyStates();
 
-    let selectedKey = await selectBestKey(apiKeys, env);
-    if (!selectedKey) {
-      selectedKey = apiKeys[Math.floor(Math.random() * apiKeys.length)];
-    }
-
+    const { pathname } = new URL(request.url);
     const assert = (success) => {
       if (!success) {
         throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
       }
     };
-    const { pathname } = new URL(request.url);
-    switch (true) {
-      case pathname.endsWith("/chat/completions"):
-        assert(request.method === "POST");
-        return handleCompletions(await request.json(), selectedKey, env, context).catch(errHandler);
-      case pathname.endsWith("/embeddings"):
-        assert(request.method === "POST");
-        return handleEmbeddings(await request.json(), selectedKey, env, context).catch(errHandler);
-      case pathname.endsWith("/models"):
-        assert(request.method === "GET");
-        return handleModels(selectedKey, env, context).catch(errHandler);
-      default:
-        throw new HttpError("404 Not Found", 404);
+
+    // 提前读取一次请求体（克隆），后续换 Key 重试时复用
+    let reqBody = null;
+    const needsBody = request.method === "POST" &&
+                      (pathname.endsWith("/chat/completions") || pathname.endsWith("/embeddings"));
+    if (needsBody) {
+      reqBody = await request.clone().json();
     }
+
+    // 外层 Key 轮询：429/5xx 自动换 Key；无剩余 Key 时返回最后一次结果
+    const MAX_ATTEMPTS = Math.max(1, (parseInt(env.MAX_RETRIES) || 2) + 1);
+    const usedKeys = new Set();
+    let lastResponse = null;
+    let lastError = null;
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const pool = apiKeys.filter(k => !usedKeys.has(k));
+      const keyPool = pool.length > 0 ? pool : apiKeys;
+
+      let selectedKey = await selectBestKey(keyPool, env);
+      if (!selectedKey) {
+        selectedKey = keyPool[Math.floor(Math.random() * keyPool.length)];
+      }
+      usedKeys.add(selectedKey);
+
+      let resp;
+      try {
+        switch (true) {
+          case pathname.endsWith("/chat/completions"):
+            assert(request.method === "POST");
+            resp = await handleCompletions(reqBody, selectedKey, env, context);
+            break;
+          case pathname.endsWith("/embeddings"):
+            assert(request.method === "POST");
+            resp = await handleEmbeddings(reqBody, selectedKey, env, context);
+            break;
+          case pathname.endsWith("/models"):
+            assert(request.method === "GET");
+            resp = await handleModels(selectedKey, env, context);
+            break;
+          default:
+            throw new HttpError("404 Not Found", 404);
+        }
+      } catch (err) {
+        lastError = err;
+        if (attempt >= MAX_ATTEMPTS - 1) break;
+        continue;
+      }
+
+      // 成功或非可重试错误 → 直接返回
+      if (resp.status < 500 && resp.status !== 429) {
+        return resp;
+      }
+
+      // 5xx/429 → 给当前 Key 记账，准备换下一个
+      const state = KEY_STATES.get(selectedKey);
+      if (state) {
+        if (resp.status === 429) {
+          try { await learn429Limit(resp.clone(), state); } catch (e) { /* best effort */ }
+        } else {
+          state.consecutiveFailures++;
+          if (state.consecutiveFailures >= 5) {
+            state.status = QUOTA_CONFIG.STATUS.FAILED;
+          }
+        }
+      }
+      lastResponse = resp;
+
+      // 没有剩余 Key 可换 → 返回最后一次结果
+      if (usedKeys.size >= apiKeys.length) break;
+    }
+
+    if (lastResponse) return lastResponse;
+    if (lastError) return errHandler(lastError);
+    throw new HttpError("All API keys exhausted", 503);
   } catch (err) {
     return errHandler(err);
   }
@@ -1111,9 +1188,6 @@ async function handleCompletions(req, apiKey, env, context) {
         return new Response(body, fixCors(response));
       }
       body = processCompletionsResponse(body, model, id, env);
-      
-      // 存入缓存
-      if (cacheKey) await setCache(cacheKey, body, env, context);
 
       try {
         const parsed = JSON.parse(body);
@@ -1133,6 +1207,9 @@ async function handleCompletions(req, apiKey, env, context) {
       } catch (e) {
         console.error('[Sanitize] Failed to parse response for cleaning:', e);
       }
+
+      // 缓存清洗后的最终版，避免下次读缓存拿到未清洗内容
+      if (cacheKey) await setCache(cacheKey, body, env, context);
     }
   }
   
@@ -1151,8 +1228,9 @@ const adjustProps = (schemaPart) => {
   }
 };
 const adjustSchema = (schema) => {
-  const obj = schema[schema.type];
-  delete obj.strict;
+  if (schema?.type === "object" && schema[schema.type]) {
+    delete schema[schema.type].strict;
+  }
   return adjustProps(schema);
 };
 
