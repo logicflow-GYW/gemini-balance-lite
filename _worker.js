@@ -682,7 +682,9 @@ async function handleRequest(request, env, context) {
   const pathname = url.pathname;
   const search = url.search;
 
-  if (!checkAuth(request, env)) {
+  const isOpenAIPath = pathname.endsWith("/chat/completions") || pathname.endsWith("/completions") || pathname.endsWith("/embeddings") || pathname.endsWith("/models");
+
+  if (!isOpenAIPath && !checkAuth(request, env)) {
     return new Response('Unauthorized - Invalid X-Auth-Token Header', { status: 401 });
   }
 
