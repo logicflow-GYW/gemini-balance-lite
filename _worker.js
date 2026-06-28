@@ -131,6 +131,13 @@ const QUOTA_CONFIG = {
   }
 };
 
+const CIRCUIT_BREAKER_CONFIG = {
+  THRESHOLD: 5,              // 连续失败 5 次触发熔断
+  COOLDOWN_MS: 60000,        // 熔断冷却时间 60 秒
+  BACKOFF_BASE_MS: 2000,     // 退避基础延迟 2 秒
+  BACKOFF_MAX_MS: 30000      // 退避最大延迟 30 秒
+};
+
 let KEY_STATES = new Map();
 
 // ============================================================
@@ -175,6 +182,9 @@ function getNextDayReset() {
 function createKeyState(keyId) {
   return {
     keyId: keyPrefix(keyId),
+    version: 0,
+    _lastSyncedRequests: 0,
+    _lastSyncedSuccesses: 0,
     rpm: {
       limit: null,
       estimated: QUOTA_CONFIG.DEFAULT_RPM,
@@ -227,10 +237,37 @@ async function saveKeyStateToKV(env, state) {
   const lastWrite = state._lastKVWrite || 0;
   if (now - lastWrite < 2000) return;
   state._lastKVWrite = now;
+  
   try {
+    const kvKey = `key_state:${state.keyId}`;
+    
+    // 乐观锁实现：读取当前版本号
+    const existingData = await env.KV_STATS.get(kvKey, { type: 'json' });
+    const currentVersion = existingData?.version || 0;
+    const newVersion = currentVersion + 1;
+    
+    // 合并策略：累加计数器，保留最新时间戳
+    const mergedState = {
+      ...state,
+      version: newVersion,
+      rpm: {
+        ...state.rpm,
+        used: Math.max(state.rpm.used, existingData?.rpm?.used || 0)
+      },
+      rpd: {
+        ...state.rpd,
+        used: Math.max(state.rpd.used, existingData?.rpd?.used || 0)
+      },
+      totalRequests: (existingData?.totalRequests || 0) + (state.totalRequests - (state._lastSyncedRequests || 0)),
+      totalSuccesses: (existingData?.totalSuccesses || 0) + (state.totalSuccesses - (state._lastSyncedSuccesses || 0))
+    };
+    
+    state._lastSyncedRequests = state.totalRequests;
+    state._lastSyncedSuccesses = state.totalSuccesses;
+    
     await env.KV_STATS.put(
-      `key_state:${state.keyId}`,
-      JSON.stringify(state),
+      kvKey,
+      JSON.stringify(mergedState),
       { expirationTtl: 86400 * 7 }
     );
   } catch (e) {
@@ -241,22 +278,20 @@ async function saveKeyStateToKV(env, state) {
 async function initializeKeyStates(apiKeys, env) {
   if (!apiKeys || apiKeys.length === 0) return;
   
-  // 清理本次请求未携带的旧 Key（防内存泄漏：长跑实例下 Map 会无限增长）
-  const currentSet = new Set(apiKeys);
-  for (const existingKey of Array.from(KEY_STATES.keys())) {
-    if (!currentSet.has(existingKey)) {
-      KEY_STATES.delete(existingKey);
+  // 修复：使用更温和的 Key 清理策略，防止因高频切换 Key 导致的状态丢失
+  const now = Date.now();
+  const TTL = 3600000; // 1 小时 inactivity
+  
+  for (const [key, state] of KEY_STATES.entries()) {
+    if (state.lastUsedAt && (now - new Date(state.lastUsedAt).getTime() > TTL)) {
+      KEY_STATES.delete(key);
     }
   }
 
   for (const key of apiKeys) {
     if (!KEY_STATES.has(key)) {
       const savedState = await loadKeyStateFromKV(env, key);
-      if (savedState) {
-        KEY_STATES.set(key, savedState);
-      } else {
-        KEY_STATES.set(key, createKeyState(key));
-      }
+      KEY_STATES.set(key, savedState || createKeyState(key));
     }
   }
 }
@@ -318,7 +353,25 @@ async function selectBestKey(apiKeys, env) {
   }
   
   if (candidates.length === 0) {
+    // 触发全局熔断检查
+    if (!env._circuitBreakerState) {
+      env._circuitBreakerState = { failures: 0, lastFailAt: null, cooldownUntil: null };
+    }
+    const now = Date.now();
+    env._circuitBreakerState.failures++;
+    env._circuitBreakerState.lastFailAt = now;
+    
+    if (env._circuitBreakerState.failures >= CIRCUIT_BREAKER_CONFIG.THRESHOLD) {
+      env._circuitBreakerState.cooldownUntil = now + CIRCUIT_BREAKER_CONFIG.COOLDOWN_MS;
+      console.error(`[Circuit Breaker] All keys exhausted, entering cooldown until ${new Date(env._circuitBreakerState.cooldownUntil).toISOString()}`);
+      return null;
+    }
     return null;
+  }
+  
+  // 成功选中 Key 时重置熔断计数器
+  if (env._circuitBreakerState) {
+    env._circuitBreakerState.failures = 0;
   }
   
   candidates.sort((a, b) => b.score - a.score);
@@ -860,7 +913,19 @@ async function handleOpenAI(request, env, context) {
   }
   const errHandler = (err) => {
     console.error(err);
-    return new Response(err.message, fixCors({ status: err.status ?? 500 }));
+    // 构造标准的 OpenAI 兼容错误 JSON 响应
+    const errorBody = {
+      error: {
+        message: err.message || "Internal Server Error",
+        type: err.name === "HttpError" ? "invalid_request_error" : "api_error",
+        param: null,
+        code: err.status || 500
+      }
+    };
+    return new Response(JSON.stringify(errorBody), fixCors({ 
+      status: err.status ?? 500,
+      headers: { "Content-Type": "application/json" }
+    }));
   };
   try {
     const auth = request.headers.get("Authorization");
@@ -903,6 +968,28 @@ async function handleOpenAI(request, env, context) {
       const keyPool = pool.length > 0 ? pool : apiKeys;
 
       let selectedKey = await selectBestKey(keyPool, env);
+      
+      // 检查熔断状态
+      if (!selectedKey && env._circuitBreakerState?.cooldownUntil) {
+        const waitTime = Math.max(0, env._circuitBreakerState.cooldownUntil - Date.now());
+        if (waitTime > 0) {
+          return new Response(JSON.stringify({
+            error: {
+              message: "All API keys exhausted. Service temporarily unavailable.",
+              type: "rate_limit_error",
+              retry_after: Math.ceil(waitTime / 1000)
+            }
+          }), {
+            status: 503,
+            headers: {
+              'Content-Type': 'application/json',
+              'Retry-After': String(Math.ceil(waitTime / 1000)),
+              'Access-Control-Allow-Origin': '*'
+            }
+          });
+        }
+      }
+
       if (!selectedKey) {
         selectedKey = keyPool[Math.floor(Math.random() * keyPool.length)];
       }
@@ -1234,8 +1321,12 @@ const adjustSchema = (schema) => {
   return adjustProps(schema);
 };
 
+const MULTIMODAL_LIMITS = {
+  MAX_IMAGE_SIZE: 20 * 1024 * 1024,   // 20MB
+  MAX_AUDIO_SIZE: 50 * 1024 * 1024,   // 50MB
+  WORKER_MEMORY_BUFFER: 0.7            // 使用 70% 内存作为安全阈值
+};
 const harmCategory = [
-  "HARM_CATEGORY_HATE_SPEECH",
   "HARM_CATEGORY_SEXUALLY_EXPLICIT",
   "HARM_CATEGORY_DANGEROUS_CONTENT",
   "HARM_CATEGORY_HARASSMENT",
@@ -1317,7 +1408,25 @@ const parseImg = async (url) => {
         throw new Error(`${response.status} ${response.statusText} (${url})`);
       }
       mimeType = response.headers.get("content-type");
-      data = ab2b64(await response.arrayBuffer());
+      const contentLength = parseInt(response.headers.get("content-length") || "0");
+      
+      // 预检尺寸限制
+      const isImage = mimeType?.startsWith("image/");
+      const isAudio = mimeType?.startsWith("audio/");
+      const sizeLimit = isImage ? MULTIMODAL_LIMITS.MAX_IMAGE_SIZE : MULTIMODAL_LIMITS.MAX_AUDIO_SIZE;
+      
+      if (contentLength > 0 && contentLength > sizeLimit) {
+        throw new Error(`${isImage ? 'Image' : 'Audio'} too large: ${(contentLength / 1024 / 1024).toFixed(2)}MB exceeds ${(sizeLimit / 1024 / 1024)}MB limit (${url})`);
+      }
+      
+      const arrayBuffer = await response.arrayBuffer();
+      
+      // 二次校验实际大小
+      if (arrayBuffer.byteLength > sizeLimit) {
+        throw new Error(`${isImage ? 'Image' : 'Audio'} size ${(arrayBuffer.byteLength / 1024 / 1024).toFixed(2)}MB exceeds limit`);
+      }
+      
+      data = ab2b64(arrayBuffer);
     } catch (err) {
       throw new Error("Error fetching image: " + err.toString());
     }
@@ -1382,8 +1491,8 @@ const transformFnCalls = ({ tool_calls }) => {
       throw new HttpError(`Unsupported tool_call type: "${type}"`, 400);
     }
     let args;
-    // 类型安全的参数解析
-    if (argstr === null || argstr === undefined) {
+    // 全防御参数解析，确保任何脏/老数据都不引起 400 崩溃
+    if (argstr == null) {
       args = {};
     } else if (typeof argstr === 'object') {
       args = argstr;
@@ -1392,13 +1501,25 @@ const transformFnCalls = ({ tool_calls }) => {
         args = {};
       } else {
         try {
-          args = JSON.parse(argstr);
+          // 优先尝试清洗 Markdown 并以标准模式解析
+          const cleaned = cleanMarkdownJSON(argstr);
+          args = JSON.parse(cleaned);
         } catch (err) {
-          throw new HttpError(`Invalid function arguments: unable to parse JSON. Original value: "${argstr.substring(0, 100)}...", Error: ${err.message}`, 400);
+          try {
+            // 失败后尝试使用宽松解析器修复格式
+            args = parseRelaxedJSON(argstr);
+          } catch (err2) {
+            console.warn(`[JSON Parse Warning] Failed to parse tool_calls arguments. Falling back to safe object. Original:`, argstr);
+            // 终极容灾降级：不抛出 HttpError，包装为安全对象，保证对话顺利不中断
+            args = {
+              __raw_malformed_arguments__: argstr,
+              __parse_error__: err.message
+            };
+          }
         }
       }
     } else {
-      throw new HttpError(`Invalid function arguments: expected string or object, got ${typeof argstr}`, 400);
+      args = { __raw_malformed_arguments__: String(argstr) };
     }
     calls[id] = { i, name };
     const part = {
@@ -1549,6 +1670,34 @@ const cleanMarkdownJSON = (value) => {
   return value;
 };
 
+// 宽松 JSON 解析器，自动修复单引号、尾随逗号、未清洗 Markdown 等常见非标 JSON
+const parseRelaxedJSON = (str) => {
+  if (typeof str !== 'string') return {};
+  let fixed = str.trim();
+  if (fixed.startsWith("```")) {
+    fixed = fixed.replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "").trim();
+  }
+  
+  try {
+    return JSON.parse(fixed);
+  } catch (e) {}
+
+  // 1. 修复尾随逗号 (Trailing Commas)
+  fixed = fixed.replace(/,(\s*[}\]])/g, '$1');
+
+  // 2. 修复单引号作为键名或值界定符
+  fixed = fixed.replace(/(['"])?(\w+)\1\s*:/g, '"$2":');
+  fixed = fixed.replace(/:\s*'((?:[^'\\]|\\.)*)'/g, ': "$1"');
+  fixed = fixed.replace(/,\s*'((?:[^'\\]|\\.)*)'/g, ', "$1"');
+  fixed = fixed.replace(/\[\s*'((?:[^'\\]|\\.)*)'/g, '["$1"');
+
+  try {
+    return JSON.parse(fixed);
+  } catch (e) {
+    throw e;
+  }
+};
+
 const SEP = "\n\n|>";
 const transformCandidates = (key, cand, env) => {
   const message = { role: "assistant", content: [], reasoning_content: [] };
@@ -1667,7 +1816,18 @@ const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB 限制
 function parseStream(chunk, controller) {
   this.buffer += chunk;
   if (this.buffer.length > MAX_BUFFER_SIZE) {
-    controller.error(new Error(`Stream buffer overflow: exceeded ${MAX_BUFFER_SIZE} bytes.`));
+    // 优雅降级：发送错误事件而非直接中断
+    const errorEvent = JSON.stringify({
+      error: {
+        message: "Response too large: stream buffer exceeded 1MB limit",
+        type: "buffer_overflow",
+        code: "stream_truncated"
+      }
+    });
+    controller.enqueue(`data: ${errorEvent}\n\n`);
+    controller.enqueue('data: [DONE]\n\n');
+    controller.close();
+    console.error(`[SSE] Buffer overflow at ${this.buffer.length} bytes`);
     return;
   }
   do {
