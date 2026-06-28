@@ -677,12 +677,13 @@ async function handleRequest(request, env, context) {
   const search = url.search;
 
   const isOpenAIPath = pathname.endsWith("/chat/completions") || pathname.endsWith("/completions") || pathname.endsWith("/embeddings") || pathname.endsWith("/models");
+  const isRootPath = pathname === '/' || pathname === '/index.html';
 
-  if (!isOpenAIPath && !checkAuth(request, env)) {
+  if (!isOpenAIPath && !isRootPath && !checkAuth(request, env)) {
     return new Response('Unauthorized - Invalid X-Auth-Token Header', { status: 401 });
   }
 
-  if (pathname === '/' || pathname === '/index.html') {
+  if (isRootPath) {
     return new Response('Proxy is Running! More Details: https://github.com/tech-shrimp/gemini-balance-lite', {
       status: 200, headers: { 'Content-Type': 'text/html' }
     });
