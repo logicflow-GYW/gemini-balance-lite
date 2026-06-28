@@ -1,73 +1,95 @@
-# Gemini Balance Lite 🚀
+# 🚀 Gemini Balance Lite V4 (Enhanced Edition)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Platform: Cloudflare Workers](https://img.shields.io/badge/Platform-Cloudflare%20Workers-F38020?logo=cloudflare)](https://workers.cloudflare.com/)
+**Gemini Balance Lite V4** 是一个运行在 Cloudflare Workers 上的高级 API 聚合网关。它旨在将多个 Google Gemini API Keys 聚合为一个单一的、高可用的、兼容 OpenAI 格式的端点。
 
-Gemini Balance Lite 是一个部署在 Cloudflare Workers 上的高性能 Gemini API 负载均衡代理。它通过智能配额学习、动态 Key 轮询和多级缓存机制，旨在最大化利用 Gemini API 的免费配额，并为用户提供极低延迟、高可用的 API 访问体验。
+通过自适应配额学习、智能 Key 轮询和状态同步机制，该项目能将不稳定的免费 API Key 转换为一个工业级的稳定服务。
+
+---
 
 ## ✨ 核心特性
 
-- **🤖 自适应配额管理**: 能够自动监测 `429 Too Many Requests` 响应，实时学习并动态调整每个 Key 的 RPM (每分钟请求数) 和 RPD (每日请求数) 限制，无需手动硬编码。
-- **⚖️ 智能评分轮询**: 基于成功率、剩余配额和健康状态为每个 Key 打分，优先调度状态最优的 Key，并具备自动冷却和故障恢复机制。
-- **🔌 OpenAI 协议兼容**: 完美支持 `/v1/chat/completions` 等 OpenAI 标准接口，可无缝接入 NextChat, LobeChat 等绝大多数主流 LLM 客户端。
-- **🧠 思维链 (CoT) 控制**: 支持三种思考内容显示模式（隐藏、独立字段、行内 XML 标签），适配不同客户端的需求。
-- **⚡ 智能 KV 缓存**: 可选开启基于 Cloudflare KV 的响应缓存，显著降低重复请求对 API 配额的消耗。
-- **📊 增强统计面板**: 提供详细的 `/stats` 接口，实时监控所有 Key 的状态、使用率及预测耗尽时间。
-- **🛡️ 安全访问控制**: 支持 `X-Auth-Token` 验证，防止接口被盗刷。
+### 1. 🧠 自适应配额管理 (Adaptive Quota)
+- **动态学习**：不再依赖硬编码的 RPM/RPD，程序会通过分析 `429 Too Many Requests` 响应实时学习每个 Key 的真实限制。
+- **智能评分**：基于成功率、剩余配额和连续成功次数为 Key 打分，优先调度“最健康”的 Key。
+- **状态机切换**：Key 在 `ACTIVE` $\rightarrow$ `COOLING` $\rightarrow$ `EXHAUSTED` $\rightarrow$ `FAILED` 之间自动切换。
 
-## 🚀 快速部署
+### 2. 🔌 完美兼容 OpenAI 协议
+- **无缝接入**：支持 `/v1/chat/completions`, `/v1/embeddings`, `/v1/models` 等标准端点。
+- **多模态支持**：支持图片、音频输入及 Google Search 增强模式。
+- **流式输出**：完美支持 SSE 流式传输，确保打字机效果流畅。
+
+### 3. 💭 思考模式 (Reasoning/CoT) 控制
+针对 Gemini 2.0 系列模型，提供三种思考内容显示模式（通过环境变量 `THINKING_DISPLAY_MODE` 配置）：
+- `separate` (默认)：将思考过程放入 `reasoning_content` 独立字段。
+- `inline`：使用 `<thinking>` 标签将思考过程合并至正文。
+- `hidden`：完全隐藏思考过程。
+
+### 4. 🛡️ 鲁棒性与防封禁
+- **指纹随机化**：随机模拟官方 Python/JS/Go SDK 的 User-Agent，降低被识别为代理的风险。
+- **全局熔断**：当所有 Key 耗尽时触发熔断机制，强制进入冷却期，保护 IP 权重。
+- **智能节流**：根据配额使用率自动引入微小随机延迟，模拟人类请求行为。
+
+### 5. 📊 实时监控与维护
+- **统计面板**：访问 `/stats` 查看集群整体容量、Key 状态分布及成功率。
+- **健康探测**：通过 `/probe` 接口一键测试并恢复失效的 Key。
+- **KV 缓存**：内置极简 KV 缓存机制，减少重复请求对配额的消耗。
+
+---
+
+## 🛠️ 部署指南
 
 ### 1. 准备工作
-- 一个 [Cloudflare](https://dash.cloudflare.com/) 账号。
-- 一个或多个 [Google AI Studio](https://aistudio.google.com/) 的 API Key。
+- 一个 Cloudflare 账号。
+- 若干个 Gemini API Key。
+- 创建两个 Cloudflare KV 命名空间：
+  - `KV_STATS`：用于存储 Key 的实时状态和配额计数。
+  - `GEMINI_DATA`：用于存储响应缓存（可选）。
 
 ### 2. 部署步骤
-#### 方法 A：使用 Wrangler 命令行（推荐）
-```bash
-# 克隆项目
-git clone https://github.com/your-username/gemini-balance-lite.git
-cd gemini-balance-lite
+1. 创建一个新的 Cloudflare Worker。
+2. 将 `_worker.js` 的内容复制到编辑器中。
+3. 在 Worker 的 **Settings $\rightarrow$ Variables** 中绑定以下环境变量：
 
-# 安装依赖
-npm install
+| 变量名 | 必填 | 说明 | 示例 |
+| :--- | :---: | :--- | :--- |
+| `AUTH_TOKEN` | ✅ | 访问网关的鉴权 Token | `your_secure_password` |
+| `KV_STATS` | ✅ | 绑定 KV 命名空间 | `(KV Binding)` |
+| `GEMINI_DATA` | ❌ | 绑定 KV 命名空间 (用于缓存) | `(KV Binding)` |
+| `MAX_RETRIES` | ❌ | 请求失败后的最大重试次数 | `2` |
+| `THINKING_DISPLAY_MODE`| ❌ | `separate` / `inline` / `hidden` | `separate` |
 
-# 登录 Cloudflare
-npx wrangler login
+---
 
-# 部署
-npm run deploy
+## 📖 API 使用说明
+
+### 鉴权方式
+所有请求必须在 Header 中携带 `X-Auth-Token` 或在 URL 参数中携带 `token`：
+```http
+X-Auth-Token: your_secure_password
 ```
 
-#### 方法 B：直接粘贴代码
-1. 在 Cloudflare Workers 控制台创建一个新 Worker。
-2. 将 `_worker.js` 的全部内容复制并粘贴到编辑器中。
-3. 在 Worker 的 `Settings` -> `Variables` 中配置环境变量（见下文）。
+### 核心端点
+- **Chat Completions**: `POST /v1/chat/completions`
+- **Embeddings**: `POST /v1/embeddings`
+- **Models List**: `GET /v1/models`
+- **统计面板**: `GET /stats` (支持 `?action=summary` 或 `?action=keys`)
+- **Key 验证**: `POST /verify` (Header 传入 `x-goog-api-key: key1,key2...`)
+- **健康探测**: `POST /probe`
 
-### 3. 环境配置
+### 示例请求 (OpenAI 格式)
+```bash
+curl https://your-worker.workers.dev/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Auth-Token: your_secure_password" \
+  -H "Authorization: Bearer key1,key2,key3" \
+  -d '{
+    "model": "gemini-2.0-flash",
+    "messages": [{"role": "user", "content": "你好！"}],
+    "stream": true
+  }'
+```
 
-在 Cloudflare Worker 的环境变量中设置以下项：
+---
 
-| 变量名 | 默认值 | 说明 | 必填 |
-| :--- | :--- | :--- | :--- |
-| `AUTH_TOKEN` | `your_secret_token` | 访问代理所需的 Token，请求头加入 `X-Auth-Token: ...` | 建议 |
-| `MAX_RETRIES` | `2` | 当 Key 触发限流时，自动重试的最大次数 | 否 |
-| `THINKING_DISPLAY_MODE` | `separate` | 思考模式：`hidden` (隐藏), `separate` (独立字段), `inline` (行内) | 否 |
-| `GEMINI_DATA` | (KV Namespace) | 用于存储 API 响应缓存的 KV 绑定 | 可选 |
-| `KV_STATS` | (KV Namespace) | 用于持久化存储 Key 状态和统计数据的 KV 绑定 | 可选 |
-
-## 🛠️ 接口指南
-
-### 1. API 请求 (OpenAI 兼容)
-- **Endpoint**: `https://your-worker.workers.dev/v1/chat/completions`
-- **Header**: 
-  - `Authorization: Bearer key1,key2,key3` (支持多个 Key 逗号分隔)
-  - `X-Auth-Token: your_secret_token` (如果配置了 AUTH_TOKEN)
-
-### 2. 管理接口
-- **验证 Key**: `POST /verify` (请求头带上 `x-goog-api-key`) $\rightarrow$ 检查 Key 是否可用。
-- **统计面板**: `GET /stats` $\rightarrow$ 查看整体集群状态。
-- **深度统计**: `GET /stats?action=keys` $\rightarrow$ 查看每个 Key 的详细配额。
-- **强制探测**: `POST /probe` $\rightarrow$ 尝试激活所有处于 `FAILED` 状态的 Key。
-
-## 📜 许可证
-本项目采用 [MIT License](LICENSE) 开源。
+## ⚖️ 免责声明
+本项目仅用于技术研究与学习，请在遵守 Google API 服务条款的前提下使用。作者不对因滥用 API 导致的 Key 封禁负责。
